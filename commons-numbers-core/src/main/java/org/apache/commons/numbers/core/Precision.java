@@ -54,6 +54,19 @@ public final class Precision {
     /** Positive zero. */
     private static final double POSITIVE_ZERO = 0d;
 
+    /** Powers of ten by which {@link #round(double, int, RoundingMode)} scales a value exactly: 10^0 to 10^9. */
+    private static final double[] POW10 = {1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9};
+
+    /** Magnitude of a scaled value below which rounding avoids the decimal conversion. */
+    private static final double ROUND_SCALED_LIMIT = 1e9;
+
+    /**
+     * Distance of a scaled value from a rounding boundary within which the decimal
+     * conversion decides. It exceeds the error bound of the scaled value, about
+     * 2.3e-7 below {@link #ROUND_SCALED_LIMIT}.
+     */
+    private static final double ROUND_BOUNDARY_MARGIN = 1e-6;
+
     static {
         /*
          *  This was previously expressed as = 0x1.0p-53
@@ -465,6 +478,22 @@ public final class Precision {
      * Precision.round(30.645, 2) == 30.65
      * </pre>
      *
+     * <p><b>Implementation note</b>
+     *
+     * <p>When {@code 0 <= scale <= 9} and {@code |x| * 10^scale < 1e9} the result is
+     * computed in {@code double} arithmetic, without the decimal conversion, unless the
+     * scaled value lies within 1e-6 of a rounding boundary (an integer for the directed
+     * modes, an integer plus one half for the half modes). The result is identical:
+     * the decimal value of {@code Double.toString(x)} is within half an ulp of {@code x}
+     * and the product {@code x * 10^scale} is within half an ulp of the exact product, so
+     * the scaled decimal and the computed product differ by less than 2.3e-7. Away from
+     * a boundary both round to the same integer {@code n}, and {@code n / 10^scale},
+     * a quotient of two exactly representable values, is the {@code double} closest to
+     * the decimal result. A value already at the scale (the scaled value is an integer
+     * {@code n} and {@code n / 10^scale == x}) is returned unchanged in every mode: no
+     * other decimal as short lies within half an ulp of {@code x}, so it is the decimal
+     * {@code Double.toString(x)} represents. All other arguments use the decimal conversion.
+     *
      * @param x Value to round.
      * @param scale Number of digits to the right of the decimal point.
      * @param roundingMode Rounding mode as defined in {@link BigDecimal}.
@@ -477,6 +506,86 @@ public final class Precision {
     public static double round(double x,
                                int scale,
                                RoundingMode roundingMode) {
+        if (scale >= 0 && scale < POW10.length) {
+            final double power = POW10[scale];
+            final double scaled = x * power;
+            final double n = roundScaled(scaled, roundingMode);
+            if (!Double.isNaN(n)) {
+                final double rounded = n / power;
+                // MATH-1089: negative values rounded to zero should result in negative zero
+                return rounded == POSITIVE_ZERO ? POSITIVE_ZERO * x : rounded;
+            }
+            // A value already at the scale: x is the double closest to an integer
+            // over 10^scale, the decimal Double.toString(x) represents.
+            if (Math.abs(scaled) < ROUND_SCALED_LIMIT && scaled == Math.rint(scaled) && scaled / power == x) {
+                return x;
+            }
+        }
+        return roundDecimal(x, scale, roundingMode);
+    }
+
+    /**
+     * Rounds a scaled value to an integer as the rounding mode rounds the scaled decimal
+     * representation of the original value. Returns {@code NaN} when the scaled value is
+     * not below {@link #ROUND_SCALED_LIMIT} in magnitude (or is not finite), when it is
+     * too close to a rounding boundary for the result to be certain, or when the rounding
+     * mode is {@link RoundingMode#UNNECESSARY}.
+     *
+     * @param scaled Scaled value.
+     * @param roundingMode Rounding mode.
+     * @return the rounded integer, or {@code NaN}.
+     */
+    private static double roundScaled(double scaled, RoundingMode roundingMode) {
+        if (Math.abs(scaled) >= ROUND_SCALED_LIMIT || Double.isNaN(scaled)) {
+            return Double.NaN;
+        }
+        final double floor = Math.floor(scaled);
+        // Exact: scaled and floor share the same exponent range below 2^52
+        final double fraction = scaled - floor;
+        if (roundingMode == RoundingMode.HALF_UP ||
+            roundingMode == RoundingMode.HALF_DOWN ||
+            roundingMode == RoundingMode.HALF_EVEN) {
+            // Away from a tie the three half modes agree
+            if (Math.abs(fraction - 0.5) <= ROUND_BOUNDARY_MARGIN) {
+                return Double.NaN;
+            }
+            return fraction < 0.5 ? floor : floor + 1;
+        }
+        // Directed modes: decide only away from an integer
+        if (fraction <= ROUND_BOUNDARY_MARGIN || fraction >= 1 - ROUND_BOUNDARY_MARGIN) {
+            return Double.NaN;
+        }
+        if (roundingMode == RoundingMode.FLOOR) {
+            return floor;
+        }
+        if (roundingMode == RoundingMode.CEILING) {
+            return floor + 1;
+        }
+        if (roundingMode == RoundingMode.DOWN) {
+            return scaled > 0 ? floor : floor + 1;
+        }
+        if (roundingMode == RoundingMode.UP) {
+            return scaled > 0 ? floor + 1 : floor;
+        }
+        // UNNECESSARY (or null): the decimal conversion decides or throws
+        return Double.NaN;
+    }
+
+    /**
+     * Rounds the given value to the specified number of decimal places using its
+     * {@code String} representation.
+     *
+     * @param x Value to round.
+     * @param scale Number of digits to the right of the decimal point.
+     * @param roundingMode Rounding mode as defined in {@link BigDecimal}.
+     * @return the rounded value.
+     * @throws ArithmeticException if {@code roundingMode} is
+     * {@link RoundingMode#UNNECESSARY} and the specified scaling operation
+     * would require rounding.
+     */
+    private static double roundDecimal(double x,
+                                       int scale,
+                                       RoundingMode roundingMode) {
         try {
             final double rounded = new BigDecimal(Double.toString(x))
                    .setScale(scale, roundingMode)
